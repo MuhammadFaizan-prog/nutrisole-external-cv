@@ -24,3 +24,6 @@ __pycache__/
 !/artifacts/native/**/README.md
 !/artifacts/native/**/validation.json
 !/artifacts/native/plain-rn-apk-inspection.json
+
+# NutriSole External-CV: mark-360 YOLO11n has no upstream licence; CI fetches and exports it at build time
+native/android/app/src/main/assets/models/mark360_*.onnx

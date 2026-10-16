@@ -32,6 +32,8 @@
     "deepLinks.ts",
     "responsive/**/*.ts",
     "responsive/**/*.tsx",
+    "extcv/**/*.ts",
+    "extcv/**/*.tsx",
     "tests/**/*.ts"
   ],
   "exclude": [

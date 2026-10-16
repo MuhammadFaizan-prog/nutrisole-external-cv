@@ -7,7 +7,7 @@ import { extensionRoutes, type ExtensionRoute } from '../../src/nutrisole/extens
 import { useSystemBack } from '../../src/nutrisole/useSystemBack.native';
 import { Onboarding, Home, LogMeal, Profile, freshApplePortion } from './CoreScreens';
 import WeeklyPlan from './WeeklyScreen';
-import Scan from './ScanScreen';
+import ExtCvScan from '../extcv/ExtCvScan';
 import ExpandedScreen from './ExpandedScreen';
 import ScreenDirectory from './ScreenDirectory';
 import TabBar from './TabBar';
@@ -84,7 +84,7 @@ export default function NutriSole({ open, requestedRoute = 'onboarding', request
   const props = { store, go, back, home, open };
   const content = route === 'flow-directory' ? <ScreenDirectory go={go} back={back} action={action} signedIn={signedIn} />
     : (extensionRoutes as readonly string[]).includes(route) ? <ExpandedScreen key={`${route}-${navigationToken}`} route={route as ExtensionRoute} state={sceneState} profile={store.state.profile} connected={store.state.connected} editingMeal={!!portionRecord?.id && !portionRecord.draft} field={expansion.field} action={action} go={go} back={back} />
-    : route === 'home' ? <Home {...props} /> : route === 'scan' ? <Scan {...props} />
+    : route === 'home' ? <Home {...props} /> : route === 'scan' ? <ExtCvScan go={go} back={back} open={open} chooseFood={setFood} />
     : route === 'log-meal' ? <LogMeal key={`${route}-${history.length}`} {...props} portion={applePortion} updatePortion={setApplePortion} /> : route === 'weekly-plan' ? <WeeklyPlan {...props} />
     : route === 'profile' ? <Profile {...props} /> : <Onboarding {...props} />;
   return <View style={{ flex: 1 }}><View style={{ flex: 1 }}>{content}</View>{showTabs(route) && <TabBar route={route} navigate={next => { Keyboard.dismiss(); if (next === 'glucose-overview') expansion.action(`choose:unit:${store.state.profile.glucoseUnit}`, go, back, open); dispatch({ type: 'tab', route: next }); }} />}</View>;
