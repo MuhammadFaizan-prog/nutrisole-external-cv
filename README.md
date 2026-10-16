@@ -1,4 +1,7 @@
-# NutriSole
+# NutriSole — External-CV experiment
+
+> This repository is a standalone experiment: NutriSole with its Scan screen driven by external open-source fruit/vegetable detectors (henningheyen YOLOv8m, mark-360 YOLO11n). See [docs/extcv/README.md](docs/extcv/README.md) and [EXTCV_NOTICES.md](EXTCV_NOTICES.md). The original project description follows.
+
 
 A frontend prototype for a food and health assistant, built with React, TypeScript, and shared React Native components. NutriSole brings food capture, portion confirmation, meal planning, glucose records, preferences, and support flows into one mobile interface.
 

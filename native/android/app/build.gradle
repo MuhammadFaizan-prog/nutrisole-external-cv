@@ -87,11 +87,11 @@ android {
 
     namespace "com.muhammadfaizan.nutrisole"
     defaultConfig {
-        applicationId "com.muhammadfaizan.nutrisole"
+        applicationId "com.muhammadfaizan.nutrisole.extcv" // separate id: installs beside other NutriSole builds
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 5
-        versionName "1.0.4"
+        versionName "1.0.4-extcv"
     }
     signingConfigs {
         debug {

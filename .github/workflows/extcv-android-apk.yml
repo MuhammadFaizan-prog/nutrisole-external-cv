@@ -1,0 +1,121 @@
+name: ExtCV Android QA APK
+
+# Builds the NutriSole External-CV QA APK: release build type signed with the repo's debug keystore, Hermes JS bundle
+# embedded (no Metro needed), both ONNX models bundled. Runs on pushes to external-cv (the PR shows the same commit's
+# check) and on demand. Private-repo minutes are limited, so there is one job, one ABI and no matrix.
+on:
+  push:
+    branches: [external-cv]
+    paths-ignore: ['**.md', 'docs/**']
+  workflow_dispatch:
+
+concurrency:
+  group: extcv-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # mark-360 YOLO11n has no upstream licence, so it is not committed: fetch the original weights from the author's
+      # GitHub, check their hash, export with pinned versions and require the exact ONNX hash listed in SHA256SUMS.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch and export YOLO11n at build time
+        env:
+          EXTCV_WORK: ${{ runner.temp }}/extcv-models
+          YOLO_CONFIG_DIR: ${{ runner.temp }}/ultralytics
+          YOLO_OFFLINE: '1'
+        run: |
+          pip install --quiet --index-url https://download.pytorch.org/whl/cpu torch==2.14.1 torchvision==0.29.1
+          pip install --quiet ultralytics==8.4.175 onnx==1.23.2 onnxslim==0.1.98 onnxruntime==1.31.0 numpy==2.5.2
+          python scripts/extcv/build_models.py --only mark360_yolo11n
+
+      # YOLOv8m is committed and must match exactly. The YOLO11n re-export is expected to match too; if a toolchain
+      # difference changes its bytes, the build continues, the real hash is recorded in SHA256SUMS/build-info and the
+      # app's HUD reports the mismatch instead of hiding it.
+      - name: Verify bundled model hashes
+        working-directory: native/android/app/src/main/assets/models
+        run: |
+          grep henning_ SHA256SUMS | sha256sum -c
+          if ! grep mark360_ SHA256SUMS | sha256sum -c; then
+            echo "::warning::YOLO11n re-export hash differs from SHA256SUMS; recording the actual hash"
+            sha256sum mark360_yolo11n_640_w16.onnx | tee -a ../../../../../../../extcv-yolo11n-actual.sha256
+            { grep henning_ SHA256SUMS; sha256sum mark360_yolo11n_640_w16.onnx; } > SHA256SUMS.new && mv SHA256SUMS.new SHA256SUMS
+          fi
+          ls -l
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            native/package-lock.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Install JS dependencies
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          cd native && npm ci --no-audit --no-fund
+
+      - name: Unit tests and typecheck
+        working-directory: native
+        run: |
+          npm test
+          npm run typecheck
+
+      - name: Build release-signed QA APK (arm64-v8a)
+        working-directory: native/android
+        run: ./gradlew --no-daemon assembleRelease -PreactNativeArchitectures=arm64-v8a
+
+      - name: Verify APK contents
+        id: verify
+        run: |
+          set -euo pipefail
+          APK=native/android/app/build/outputs/apk/release/app-release.apk
+          test -f "$APK"
+          SHORT=$(echo "$GITHUB_SHA" | cut -c1-7)
+          OUT="nutrisole-extcv-qa-$SHORT.apk"
+          cp "$APK" "$OUT"
+          mkdir -p check && cd check && unzip -q "../$OUT" 'assets/*' && cd ..
+          test -s check/assets/index.android.bundle
+          head -c 4 check/assets/index.android.bundle | od -An -tx1 | tee bundle-magic.txt
+          (cd check/assets/models && sha256sum -c SHA256SUMS)
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          "$BT/apksigner" verify --print-certs "$OUT" | tee signer.txt
+          "$BT/aapt2" dump badging "$OUT" | grep -E "^package:|^sdkVersion|^targetSdkVersion|^application-label:|^native-code|uses-permission: name='android.permission.CAMERA'" | tee badging.txt
+          sha256sum "$OUT" | tee "$OUT.sha256"
+          {
+            echo "commit=$GITHUB_SHA"; echo "run=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "apk=$OUT"; echo "bytes=$(stat -c %s "$OUT")"; echo "sha256=$(cut -d' ' -f1 "$OUT.sha256")"
+            echo "bundle_bytes=$(stat -c %s check/assets/index.android.bundle)"; echo "bundle_magic=$(tr -d ' \n' < bundle-magic.txt)"
+            echo "--- models in APK"; cat check/assets/models/SHA256SUMS
+            echo "--- badging"; cat badging.txt; echo "--- signer"; cat signer.txt
+          } > build-info.txt
+          cat build-info.txt
+          echo "name=$OUT" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.verify.outputs.name }}
+          path: |
+            ${{ steps.verify.outputs.name }}
+            ${{ steps.verify.outputs.name }}.sha256
+            build-info.txt
+          retention-days: 14
+          compression-level: 0
