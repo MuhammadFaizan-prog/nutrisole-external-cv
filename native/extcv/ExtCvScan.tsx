@@ -3,7 +3,7 @@
 // on the camera thread), boxes + labels over the preview, a perf HUD, a model picker, and a tap-through result screen.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { BackHandler, Linking, Pressable, StyleSheet, View } from 'react-native';
+import { AppState, BackHandler, Linking, Pressable, StyleSheet, View } from 'react-native';
 import { Camera, CommonResolutions, useCameraDevice, useCameraPermission, useFrameOutput, type Frame } from 'react-native-vision-camera';
 import { useResizer } from 'react-native-vision-camera-resizer';
 import { createSynchronizable, scheduleOnRN } from 'react-native-worklets';
@@ -15,6 +15,7 @@ import { loadModel, releaseModel, runModel, type LoadedModel } from './detector'
 import { DEFAULT_MODEL, MODEL_ORDER, MODELS, type ModelId } from './models';
 import { addQuarterTurns, frameToViewCover, rotatePlanarToUpright, type Orientation } from './geometry';
 import { interpret, RateMeter, CONFIDENT_MIN, type Detection, type ScanResult } from './pipeline';
+import { cameraDiagLine, cameraPhase, errorText, FRAME_LADDER, nextFormat, NO_TIMES, permissionGate, type CamTimes, type FrameFormat } from './cameraState';
 import type { AppFood } from './classes';
 
 export type ExtCvProps = { go: (r: AppRoute) => void; back: () => void; open: (sheet: Sheet) => void; chooseFood: (food: string) => void };
@@ -66,8 +67,19 @@ function LiveCamera({ back, open, modelId, setModelId, loaded, modelError, openR
   modelId: ModelId; setModelId: (m: ModelId) => void; loaded: LoadedModel | null; modelError: string;
   openResult: (d: Detection | null) => void; openAbout: () => void;
 }) {
-  const { hasPermission, requestPermission, canRequestPermission } = useCameraPermission();
+  const { status: permStatus, requestPermission, canRequestPermission } = useCameraPermission();
+  const gate = permissionGate(permStatus, canRequestPermission);
+  const hasPermission = gate.kind === 'granted';
   const device = useCameraDevice('back');
+  // Camera start-up diagnostics (see cameraState.ts): timestamps from the Camera callbacks, the frame format being tried,
+  // the last camera error, and a remount key for Retry.
+  const [format, setFormat] = useState<FrameFormat>(FRAME_LADDER[0]);
+  const [times, setTimes] = useState<CamTimes>(NO_TIMES);
+  const [camError, setCamError] = useState('');
+  const [frameInfo, setFrameInfo] = useState('');
+  const [camKey, setCamKey] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
+  const [appActive, setAppActive] = useState(AppState.currentState !== 'background');
   const [layout, setLayout] = useState({ width: 0, height: 0 });
   const [result, setResult] = useState<ScanResult | null>(null);
   const [perf, setPerf] = useState<Perf>({ inferMs: 0, totalMs: 0, fps: 0, orientation: '-', frame: '-', dropped: 0, skipped: 0 });
@@ -81,7 +93,14 @@ function LiveCamera({ back, open, modelId, setModelId, loaded, modelError, openR
   const loadedRef = useRef(loaded); loadedRef.current = loaded;
   const turnsRef = useRef(turns); turnsRef.current = turns;
 
-  useEffect(() => { if (!hasPermission && canRequestPermission) requestPermission(); }, [hasPermission, canRequestPermission, requestPermission]);
+  // Ask for CAMERA once when the status is still undetermined; a denial switches to the Settings UI (no request loop).
+  const asked = useRef(false);
+  useEffect(() => {
+    if (gate.kind !== 'request' || asked.current) return;
+    asked.current = true;
+    requestPermission().catch(e => setCamError(`permission request failed: ${errorText(e)}`));
+  }, [gate.kind, requestPermission]);
+  useEffect(() => { const sub = AppState.addEventListener('change', st => setAppActive(st === 'active')); return () => sub.remove(); }, []);
 
   const resizer = useResizer({ width: SIZE, height: SIZE, channelOrder: 'rgb', dataType: 'float32', scaleMode: 'contain', pixelLayout: 'planar' });
   // true while a frame is being converted or an inference is running; read on the camera thread, cleared on the JS thread.
@@ -112,12 +131,53 @@ function LiveCamera({ back, open, modelId, setModelId, loaded, modelError, openR
   const onFrameError = useCallback((message: string) => setRunError(message), []);
   const countDrop = useCallback(() => { dropped.current += 1; }, []);
 
-  const active = hasPermission && !!device && !paused;
+  const active = hasPermission && !!device && !paused && appActive;
+  // Start-up clock: restarts whenever the camera is (re)activated or remounted.
+  useEffect(() => { setTimes(active ? { ...NO_TIMES, activeAt: Date.now() } : NO_TIMES); if (active) setNow(Date.now()); }, [active, camKey]);
+  const phase = cameraPhase(times, format, now, camError);
+  // Re-evaluate timeouts once a second while something is still pending.
+  const pending = phase.kind === 'starting' || phase.kind === 'frames-wait';
+  useEffect(() => { if (!pending) return; const id = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(id); }, [pending]);
+  const attachFrames = times.previewAt != null && format !== 'off';
+  // Asked on the camera thread: report the next frame (first frame of the current format) back to JS.
+  const needFirst = useMemo(() => createSynchronizable(false), []);
+  useEffect(() => {
+    if (!attachFrames) return;
+    needFirst.setBlocking(true);
+    const t = Date.now(); setTimes(x => ({ ...x, framesAttachedAt: t, firstFrameAt: null })); setNow(t);
+  }, [attachFrames, format, needFirst]);
+  // Abandon `failed` (only if it is still the current format, so a burst of errors skips one step, not several) and
+  // restart the first-frame clock in the same render so the old timestamp cannot time out the next format too.
+  const failFormat = useCallback((failed: FrameFormat, why: string) => {
+    setCamError(why);
+    setFormat(f => (f === failed ? nextFormat(f) : f));
+    const t = Date.now(); setTimes(x => ({ ...x, framesAttachedAt: t, firstFrameAt: null }));
+  }, []);
+  useEffect(() => { if (phase.kind === 'frames-timeout') failFormat(format, `no frames within 8 s with ${format} frames`); }, [phase.kind, format, failFormat]);
+  const onFirstFrame = useCallback((w: number, h: number, pixelFormat: string) => {
+    setTimes(x => ({ ...x, firstFrameAt: Date.now() }));
+    setFrameInfo(`${w}×${h} ${pixelFormat}`);
+  }, []);
+  const onCamError = useCallback((e: Error) => {
+    const msg = errorText(e);
+    // An error after the frame output was attached: drop that format and go on with the next one (preview stays).
+    if (attachFrames) failFormat(format, `${format}: ${msg}`); else setCamError(msg);
+  }, [attachFrames, format, failFormat]);
+  const onPreviewStarted = useCallback(() => setTimes(x => (x.activeAt == null || x.previewAt != null ? x : { ...x, previewAt: Date.now() })), []);
+  // A preview stop is only counted: attaching the frame output re-binds the session, which briefly stops the preview, and
+  // treating that as "no preview" would detach the frames again in a loop. A real stall shows up as frames-timeout.
+  const [previewStops, setPreviewStops] = useState(0);
+  const onPreviewStopped = useCallback(() => setPreviewStops(n => n + 1), []);
+  const onConfigured = useCallback(() => setTimes(x => (x.activeAt == null ? x : { ...x, configuredAt: x.configuredAt ?? Date.now() })), []);
+  const onStarted = useCallback(() => setTimes(x => (x.activeAt == null ? x : { ...x, startedAt: x.startedAt ?? Date.now() })), []);
+  const onInterruption = useCallback((reason: string) => setCamError(`camera interrupted: ${reason}`), []);
+  const retryCamera = () => { setCamError(''); setFrameInfo(''); setFormat(FRAME_LADDER[0]); setCamKey(k => k + 1); };
   const ready = resizer.state === 'ready' && !!loaded;
   const r0 = resizer.resizer;
 
   const onFrame = useCallback((frame: Frame) => {
     'worklet';
+    if (needFirst.getDirty()) { needFirst.setBlocking(false); scheduleOnRN(onFirstFrame, frame.width, frame.height, String(frame.pixelFormat)); }
     if (r0 == null || !ready) { frame.dispose(); return; }
     if (busy.getDirty()) { skipped.setBlocking(n => n + 1); frame.dispose(); return; }
     busy.setBlocking(true);
@@ -131,16 +191,18 @@ function LiveCamera({ back, open, modelId, setModelId, loaded, modelError, openR
       frame.dispose(); busy.setBlocking(false);
       scheduleOnRN(onFrameError, String(e));
     }
-  }, [r0, ready, busy, skipped, onTensor, onFrameError]);
+  }, [r0, ready, busy, skipped, onTensor, onFrameError, needFirst, onFirstFrame]);
 
+  // CPU YUV (or RGBA) ImageAnalysis frames: always combinable with a preview stream. The resizer accepts them on Android.
   const frameOutput = useFrameOutput({
     targetResolution: CommonResolutions.HD_16_9,
-    pixelFormat: 'native',
-    enablePreviewSizedOutputBuffers: true,
+    pixelFormat: format === 'rgb' ? 'rgb' : 'yuv',
     dropFramesWhileBusy: true,
     onFrame,
     onFrameDropped: countDrop,
   });
+  // Preview first, frames only once the preview is streaming, so frame processing can never keep the preview black.
+  const outputs = useMemo(() => (attachFrames ? [frameOutput] : []), [attachFrames, frameOutput]);
 
   const pickModel = () => open({
     title: 'Detection model',
@@ -154,8 +216,9 @@ function LiveCamera({ back, open, modelId, setModelId, loaded, modelError, openR
       .concat([{ label: hud ? 'Hide performance HUD' : 'Show performance HUD', selected: false, action: () => setHud(v => !v) }]),
   });
 
-  const status = !hasPermission ? 'Camera permission is needed to scan.'
+  const status = gate.kind !== 'granted' ? gate.message
     : !device ? 'No back camera found on this device.'
+    : phase.kind === 'preview-timeout' ? phase.message
     : resizer.state === 'error' ? `Frame resizer unavailable on this phone (needs Android 9+ with Vulkan): ${resizer.error.message}`
     : modelError ? `Model failed to load: ${modelError}`
     : !loaded ? `Loading ${MODELS[modelId].short}…`
@@ -169,10 +232,12 @@ function LiveCamera({ back, open, modelId, setModelId, loaded, modelError, openR
 
   return <View testID="screen-scan" style={{ flex: 1, backgroundColor: '#111' }}>
     <View style={{ flex: 1 }} onLayout={e => { const { width, height } = e.nativeEvent.layout; setLayout(l => l.width === width && l.height === height ? l : { width, height }); }}>
-      {hasPermission && device ? <Camera style={StyleSheet.absoluteFill} device={device} isActive={active} outputs={[frameOutput]} orientationSource="interface" resizeMode="cover" />
+      {hasPermission && device ? <Camera key={camKey} style={StyleSheet.absoluteFill} device={device} isActive={active} outputs={outputs} orientationSource="interface" resizeMode="cover"
+          onConfigured={onConfigured} onStarted={onStarted} onError={onCamError} onPreviewStarted={onPreviewStarted} onPreviewStopped={onPreviewStopped} onInterruptionStarted={onInterruption} />
         : <View style={[StyleSheet.absoluteFill, { alignItems: 'center', justifyContent: 'center', padding: 30, gap: 16 }]}>
           <T size={17} color="#fff" style={s.center}>{status}</T>
-          {!hasPermission && <Button label="Allow camera" text={canRequestPermission ? 'Allow camera' : 'Open settings'} primary onPress={() => canRequestPermission ? requestPermission() : Linking.openSettings()} />}
+          {gate.kind === 'request' && <Button label="Allow camera" text="Allow camera" primary onPress={() => { requestPermission().catch(e => setCamError(errorText(e))); }} />}
+          {gate.kind === 'settings' && <Button label="Open settings" text="Open settings" primary onPress={() => Linking.openSettings()} />}
         </View>}
       {/* Detection overlay */}
       {result && layout.width > 0 && result.detections.map(d => {
@@ -203,8 +268,18 @@ function LiveCamera({ back, open, modelId, setModelId, loaded, modelError, openR
         <T size={11} color="#fff" style={{ fontFamily: 'monospace' }}>{`${perf.fps.toFixed(1)} inf/s · skipped ${perf.skipped} · cam-dropped ${perf.dropped}`}</T>
         <T size={11} color="#ccc" style={{ fontFamily: 'monospace' }}>{`frame ${perf.frame} ${perf.orientation}`}</T>
         {loaded && <T size={11} color={loaded.hashOk ? '#9fe8a8' : '#ff8a80'} style={{ fontFamily: 'monospace' }}>{`model ${loaded.hashOk ? 'sha256 ok' : 'SHA MISMATCH'} · load ${loaded.loadMs} ms`}</T>}
+        <T size={11} color="#9ecbff" style={{ fontFamily: 'monospace', maxWidth: 330 }}>{`cam ${cameraDiagLine({ permission: String(permStatus), deviceId: device?.id ?? null, format, times, frameInfo })}`}</T>
+        <T size={11} color="#9ecbff" style={{ fontFamily: 'monospace' }}>{`cam phase ${phase.kind}${phase.kind === 'starting' ? `: ${phase.stage}` : ''} · prev-stops ${previewStops} · resizer ${resizer.state}`}</T>
+        {!!camError && <T size={11} color="#ff8a80" style={{ fontFamily: 'monospace', maxWidth: 330 }}>{`cam error ${camError}`}</T>}
       </View>}
-      {!!status && hasPermission && device && <View style={{ position: 'absolute', left: 20, right: 20, top: '45%', backgroundColor: '#000c', borderRadius: 16, padding: 14 }}><T size={15} color="#fff" style={s.center}>{status}</T></View>}
+      {!!status && hasPermission && device && <View style={{ position: 'absolute', left: 20, right: 20, top: '45%', backgroundColor: '#000c', borderRadius: 16, padding: 14, gap: 10 }}>
+        <T size={15} color="#fff" style={s.center}>{status}</T>
+        {phase.kind === 'preview-timeout' && <Button label="Retry camera" text="Retry camera" primary onPress={retryCamera} />}
+      </View>}
+      {phase.kind === 'preview-only' && <View style={{ position: 'absolute', left: 20, right: 20, top: '45%', backgroundColor: '#000c', borderRadius: 16, padding: 14, gap: 10 }}>
+        <T size={15} color="#fff" style={s.center}>{phase.message}</T>
+        <Button label="Retry live detection" text="Retry live detection" onPress={retryCamera} />
+      </View>}
     </View>
     {/* Bottom: result banner + controls */}
     <View testID="footer-scan" style={{ backgroundColor: '#11110f', paddingHorizontal: 14, paddingTop: 12, paddingBottom: 16, gap: 12 }}>
@@ -212,8 +287,8 @@ function LiveCamera({ back, open, modelId, setModelId, loaded, modelError, openR
         style={[s.row, { minHeight: 64, borderRadius: 20, paddingHorizontal: 16, paddingVertical: 10, backgroundColor: banner?.tone === 'ok' ? '#173e27' : banner?.tone === 'low' ? '#4a3a12' : '#262622' }]}>
         <Icons name={banner?.tone === 'ok' ? 'ScanSearch' : banner?.tone === 'low' ? 'CircleAlert' : 'Scan'} size={26} color="#fff" />
         <View style={[s.flex, { gap: 3 }]}>
-          <T size={18} bold color="#fff">{banner?.title ?? (ready ? 'Starting camera…' : 'Getting ready…')}</T>
-          <T size={13} color="#ddd8cf">{banner?.sub ?? 'Detection runs automatically on live frames'}</T>
+          <T size={18} bold color="#fff">{banner?.title ?? (phase.kind === 'preview-timeout' ? 'Camera did not start' : phase.kind === 'preview-only' ? 'Preview only' : !ready ? 'Getting ready…' : phase.kind === 'running' ? 'Scanning…' : 'Starting camera…')}</T>
+          <T size={13} color="#ddd8cf">{banner?.sub ?? (phase.kind === 'starting' ? `Camera: ${phase.stage}` : phase.kind === 'frames-wait' ? 'Preview on · waiting for the first camera frame' : phase.kind === 'preview-timeout' ? 'See the message above · tap Retry camera' : 'Detection runs automatically on live frames')}</T>
         </View>
         {banner && banner.tone !== 'none' && <Icons name="ChevronRight" size={20} color="#fff" />}
       </Tap>
